@@ -48,11 +48,15 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->dying = 0;
   pthread_mutex_init(&(sock->death_lock), NULL);
 
-  // FIXME: Sequence numbers should be randomly initialized. The next expected
+  // Sequence numbers should be randomly initialized. The next expected
   // sequence number should be initialized according to the SYN packet from the
   // other side of the connection.
-  sock->window.last_ack_received = 0;
+  srand(time(NULL) ^ getpid());
+  sock->window.my_isn = rand();
+  sock->window.last_ack_received = sock->window.my_isn;
+  sock->window.next_seq_to_send = sock->window.my_isn;
   sock->window.next_seq_expected = 0;
+  sock->window.size = CP1_WINDOW_SIZE;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
@@ -149,12 +153,14 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
       }
     // Fall through.
     case NO_WAIT:
+      // Only do smth if there is data to read.
       if (sock->received_len > 0) {
         if (sock->received_len > length)
           read_len = length;
         else
           read_len = sock->received_len;
 
+        // Copy received_buf data to buf 
         memcpy(buf, sock->received_buf, read_len);
         if (read_len < sock->received_len) {
           new_buf = malloc(sock->received_len - read_len);

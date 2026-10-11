@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/time.h>
 
 #include "cmu_packet.h"
 #include "grading.h"
@@ -26,11 +27,6 @@
 #define EXIT_SUCCESS 0
 #define EXIT_ERROR -1
 #define EXIT_FAILURE 1
-
-typedef struct {
-  uint32_t next_seq_expected;
-  uint32_t last_ack_received;
-} window_t;
 
 /**
  * CMU-TCP socket types. (DO NOT CHANGE.)
@@ -40,25 +36,43 @@ typedef enum {
   TCP_LISTENER = 1,
 } cmu_socket_type_t;
 
-/**
- * This structure holds the state of a socket. You may modify this structure as
- * you see fit to include any additional state you need for your implementation.
- */
+typedef struct {
+  // Sender-side
+  uint32_t last_ack_received; // window left edge
+  uint32_t next_seq_to_send;  // next byte to transmit
+  uint32_t size;              // window size
+
+  // retransmission timer
+  struct timeval timer_start;
+  int timer_running;
+
+  // receiver
+  uint32_t next_seq_expected;
+
+  // connection
+  int state;
+  uint32_t my_isn;
+  uint32_t peer_isn;
+
+} window_t;
 typedef struct {
   int socket;
   pthread_t thread_id;
   uint16_t my_port;
   struct sockaddr_in conn;
+
   uint8_t* received_buf;
-  int received_len;
-  pthread_mutex_t recv_lock;
-  pthread_cond_t wait_cond;
   uint8_t* sending_buf;
+  int received_len;
   int sending_len;
-  cmu_socket_type_t type;
+  pthread_mutex_t recv_lock;
   pthread_mutex_t send_lock;
-  int dying;
   pthread_mutex_t death_lock;
+  pthread_cond_t wait_cond;
+  
+  cmu_socket_type_t type;
+  int dying;
+
   window_t window;
 } cmu_socket_t;
 
