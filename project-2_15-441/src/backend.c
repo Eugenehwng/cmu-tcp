@@ -33,7 +33,22 @@
 /**
  * Connection states stored in window.state.
  */
-enum { CLOSED = 0, SYN_SENT, SYN_RCVD, ESTABLISHED };
+enum {
+  CLOSED = 0,
+  SYN_SENT,
+  SYN_RCVD,
+  ESTABLISHED,
+  FIN_WAIT_1,
+  FIN_WAIT_2,
+  TIME_WAIT,
+  LAST_ACK
+};
+
+/**
+ * Gives up on an unanswered FIN after this many transmissions, so a vanished
+ * peer cannot keep cmu_close() from returning.
+ */
+#define MAX_FIN_TRANSMISSIONS 5
 
 /* ───────────────────────────── Part 0: helpers ───────────────────────────── */
 
@@ -72,9 +87,9 @@ static void send_data_segment(cmu_socket_t *sock, uint8_t *data,
   uint16_t plen = hlen + len;
   uint16_t adv_window = 1;
 
-  // flags = 0: tests classify data packets by flags == 0.
-  uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, plen, 0, adv_window, 0,
-                               NULL, data + (seq - seq_base), len);
+  uint8_t *pkt =
+      create_packet(src, dst, seq, ack, hlen, plen, ACK_FLAG_MASK, adv_window,
+                    0, NULL, data + (seq - seq_base), len);
   if (pkt == NULL) return;
 
   sendto(sock->socket, pkt, plen, 0, (struct sockaddr *)&(sock->conn),
@@ -189,7 +204,9 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   uint8_t flags = get_flags(hdr);
   int is_syn = flags & SYN_FLAG_MASK;
   int is_ack = flags & ACK_FLAG_MASK;
+  int is_fin = flags & FIN_FLAG_MASK;
   uint16_t payload_len = get_payload_len(pkt);
+  int need_ack = 0;
 
   if (is_syn) {
     // A retransmitted SYN-ACK after we are ESTABLISHED means our final
@@ -227,6 +244,20 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     }
     // Cumulative ACK, also sent for out-of-order or duplicate data so the
     // sender learns what we are still missing.
+    need_ack = 1;
+  }
+
+  if (is_fin) {
+    // The FIN occupies the sequence number right after the payload.
+    if (get_seq(hdr) + payload_len == sock->window.next_seq_expected) {
+      sock->window.next_seq_expected += 1;
+      sock->window.fin_received = 1;
+    }
+    // ACK retransmitted FINs too: our previous ACK may have been lost.
+    need_ack = 1;
+  }
+
+  if (need_ack) {
     send_control_packet(sock, sock->window.next_seq_to_send,
                         sock->window.next_seq_expected, ACK_FLAG_MASK);
   }
@@ -438,7 +469,7 @@ static void listener_handshake(cmu_socket_t *sock) {
       // (b) The final ACK. (d) In-order data: the final ACK was lost but the
       // initiator already considers the connection open.
       int good_ack = !is_syn && is_ack && get_ack(hdr) == my_isn + 1;
-      int in_order_data = !is_syn && !is_ack && has_payload &&
+      int in_order_data = !is_syn && has_payload &&
                           get_seq(hdr) == sock->window.next_seq_expected;
 
       if (good_ack || in_order_data) {
@@ -461,6 +492,61 @@ static void listener_handshake(cmu_socket_t *sock) {
   }
 }
 
+/* ─────────────────────────── teardown ─────────────────────────── */
+
+/**
+ * Closes the connection once all of our data has been acknowledged.
+ *
+ * Active close (we send FIN first): FIN_WAIT_1 -> FIN_WAIT_2 -> TIME_WAIT.
+ * Passive close (peer's FIN already arrived): LAST_ACK.
+ * Data and FINs from the peer keep being handled (and ACKed) throughout.
+ */
+static void teardown(cmu_socket_t *sock) {
+  int active_close = !sock->window.fin_received;
+  uint32_t fin_seq = sock->window.next_seq_to_send;
+
+  // The FIN consumes one sequence number; it is ACKed with fin_seq + 1.
+  sock->window.next_seq_to_send = fin_seq + 1;
+  sock->window.state = active_close ? FIN_WAIT_1 : LAST_ACK;
+
+  for (int tries = 0; tries < MAX_FIN_TRANSMISSIONS &&
+                      before(sock->window.last_ack_received,
+                             sock->window.next_seq_to_send);
+       tries++) {
+    send_control_packet(sock, fin_seq, sock->window.next_seq_expected,
+                        FIN_FLAG_MASK);
+    start_timer(sock);
+    while (!timer_expired(sock) && before(sock->window.last_ack_received,
+                                          sock->window.next_seq_to_send)) {
+      receive_and_handle(sock, timer_remaining_ms(sock));
+    }
+  }
+  stop_timer(sock);
+
+  if (!active_close) return;
+
+  // FIN_WAIT_2: we may still receive data until the peer sends its FIN. Give
+  // up if the peer goes silent for 2 * DEFAULT_TIMEOUT.
+  sock->window.state = FIN_WAIT_2;
+  while (!sock->window.fin_received) {
+    if (!receive_and_handle(sock, 2 * DEFAULT_TIMEOUT)) break;
+  }
+
+  // TIME_WAIT: stay around for 2 * DEFAULT_TIMEOUT to re-ACK the peer's FIN
+  // in case our ACK was lost.
+  if (sock->window.fin_received) {
+    sock->window.state = TIME_WAIT;
+    for (int i = 0; i < 2; i++) {
+      start_timer(sock);
+      while (!timer_expired(sock)) {
+        receive_and_handle(sock, timer_remaining_ms(sock));
+      }
+    }
+    stop_timer(sock);
+  }
+  sock->window.state = CLOSED;
+}
+
 void *begin_backend(void *in) {
   cmu_socket_t *sock = (cmu_socket_t *)in;
   int death, buf_len, send_signal;
@@ -469,6 +555,7 @@ void *begin_backend(void *in) {
   sock->window.state = CLOSED;
   sock->window.timer_running = 0;
   sock->window.peer_isn = 0;
+  sock->window.fin_received = 0;
 
   if (sock->type == TCP_INITIATOR) {
     initiator_handshake(sock);
@@ -517,6 +604,8 @@ void *begin_backend(void *in) {
       pthread_cond_signal(&(sock->wait_cond));
     }
   }
+
+  teardown(sock);
 
   pthread_exit(NULL);
   return NULL;

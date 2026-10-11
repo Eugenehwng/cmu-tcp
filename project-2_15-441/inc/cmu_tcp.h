@@ -53,6 +53,7 @@ typedef struct {
   int state;
   uint32_t my_isn;
   uint32_t peer_isn;
+  int fin_received;  // peer's FIN has been received in order
 
 } window_t;
 typedef struct {
