@@ -29,25 +29,16 @@
  *
  */
 void functionality(cmu_socket_t *sock) {
-  uint8_t buf[BUF_SIZE];
-  FILE *fp;
-  int n;
-
-  n = cmu_read(sock, buf, BUF_SIZE, NO_FLAG);
-  printf("R: %s\n", buf);
-  printf("N: %d\n", n);
-  cmu_write(sock, "hi there", 9);
-  n = cmu_read(sock, buf, 200, NO_FLAG);
-  printf("R: %s\n", buf);
-  printf("N: %d\n", n);
-  cmu_write(sock, "https://www.youtube.com/watch?v=dQw4w9WgXcQ", 44);
-
-  sleep(1);
-  n = cmu_read(sock, buf, BUF_SIZE, NO_FLAG);
-  printf("N: %d\n", n);
-  fp = fopen("/tmp/file.c", "w");
-  fwrite(buf, 1, n, fp);
-  fclose(fp);
+  int expect = atoi(getenv("nbytes") ? getenv("nbytes") : "0");
+  uint8_t buf[2000];
+  int got = 0;
+  while (got < expect) {
+    int n = cmu_read(sock, buf, sizeof(buf), NO_FLAG);
+    if (n <= 0) exit(EXIT_FAILURE);
+    got += n;
+  }
+  printf("got %d\n", got);
+  fflush(stdout);
 }
 
 int main() {

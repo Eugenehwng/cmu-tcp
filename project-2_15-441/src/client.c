@@ -18,34 +18,26 @@
 
 #include "cmu_tcp.h"
 
+#include <sys/time.h>
 void functionality(cmu_socket_t *sock) {
-  uint8_t buf[9898];
-  int read;
-  FILE *fp;
-
-  cmu_write(sock, "hi there", 8);
-  cmu_write(sock, " https://www.youtube.com/watch?v=dQw4w9WgXcQ", 44);
-  cmu_write(sock, " https://www.youtube.com/watch?v=Yb6dZ1IFlKc", 44);
-  cmu_write(sock, " https://www.youtube.com/watch?v=xvFZjo5PgG0", 44);
-  cmu_write(sock, " https://www.youtube.com/watch?v=8ybW48rKBME", 44);
-  cmu_write(sock, " https://www.youtube.com/watch?v=xfr64zoBTAQ", 45);
-  cmu_read(sock, buf, 200, NO_FLAG);
-
-  cmu_write(sock, "hi there", 9);
-  cmu_read(sock, buf, 200, NO_FLAG);
-  printf("R: %s\n", buf);
-
-  read = cmu_read(sock, buf, 200, NO_WAIT);
-  printf("Read: %d\n", read);
-
-  fp = fopen("/vagrant/project-2_15-441/src/cmu_tcp.c", "rb");
-  read = 1;
-  while (read > 0) {
-    read = fread(buf, 1, 2000, fp);
-    if (read > 0) {
-      cmu_write(sock, buf, read);
-    }
+  const char *path = getenv("payload");
+  if (!path) path = "/tmp/payload.bin";
+  FILE *fp = fopen(path, "rb");
+  if (!fp) exit(EXIT_FAILURE);
+  uint8_t buf[2000];
+  int total = 0;
+  struct timeval t0, t1;
+  gettimeofday(&t0, NULL);
+  int n;
+  while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+    if (cmu_write(sock, buf, n) < 0) exit(EXIT_FAILURE);
+    total += n;
   }
+  gettimeofday(&t1, NULL);
+  fclose(fp);
+  double seconds = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
+  printf("%d %.6f\n", total, seconds);
+  fflush(stdout);
 }
 
 int main() {
