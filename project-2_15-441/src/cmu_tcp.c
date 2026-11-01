@@ -38,11 +38,15 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->socket = sockfd;
   sock->received_buf = NULL;
   sock->received_len = 0;
+  sock->ooo_head = NULL;
+  sock->ooo_bytes = 0;
+  sock->adv_cache = (MAX_NETWORK_BUFFER > 65535) ? 65535 : MAX_NETWORK_BUFFER;
   pthread_mutex_init(&(sock->recv_lock), NULL);
 
   sock->sending_buf = NULL;
   sock->sending_len = 0;
   pthread_mutex_init(&(sock->send_lock), NULL);
+  pthread_cond_init(&(sock->send_cond), NULL);
 
   sock->type = socket_type;
   sock->dying = 0;
@@ -55,8 +59,21 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->window.my_isn = rand();
   sock->window.last_ack_received = sock->window.my_isn;
   sock->window.next_seq_to_send = sock->window.my_isn;
+  sock->window.highwater = sock->window.my_isn;
   sock->window.next_seq_expected = 0;
-  sock->window.size = CP1_WINDOW_SIZE;
+  sock->window.size = WINDOW_INITIAL_WINDOW_SIZE;
+  sock->window.cwnd = WINDOW_INITIAL_WINDOW_SIZE;
+  sock->window.ssthresh = WINDOW_INITIAL_SSTHRESH;
+  sock->window.ca_carry = 0;
+  sock->window.cc_state = (WINDOW_INITIAL_WINDOW_SIZE < WINDOW_INITIAL_SSTHRESH)
+                              ? CC_SLOW_START
+                              : CC_AVOIDANCE;
+  sock->window.dup_ack_count = 0;
+  sock->window.do_fast_retransmit = 0;
+  sock->window.peer_adv_window = sock->adv_cache;
+  sock->window.zero_advertised = 0;
+  sock->window.last_wnd_update.tv_sec = 0;
+  sock->window.last_wnd_update.tv_usec = 0;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
@@ -127,6 +144,12 @@ int cmu_close(cmu_socket_t *sock) {
     if (sock->sending_buf != NULL) {
       free(sock->sending_buf);
     }
+    while (sock->ooo_head != NULL) {
+      recv_seg_t* seg = sock->ooo_head;
+      sock->ooo_head = seg->next;
+      free(seg->data);
+      free(seg);
+    }
   } else {
     perror("ERROR null socket\n");
     return EXIT_ERROR;
@@ -174,6 +197,14 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
           sock->received_buf = NULL;
           sock->received_len = 0;
         }
+        // A full window stays shut until the application reads. Tell the
+        // peer once, when this read is what opens it. Later reads piggyback
+        // the new window on ordinary ACKs, so we don't emit extra dup ACKs.
+        int was_closed = sock->adv_cache == 0;
+        refresh_adv_cache(sock);
+        if (was_closed && sock->adv_cache > 0) {
+          send_window_update(sock);
+        }
       }
       break;
     default:
@@ -185,15 +216,34 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
 }
 
 int cmu_write(cmu_socket_t *sock, const void *buf, int length) {
-  while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
-  }
-  if (sock->sending_buf == NULL)
-    sock->sending_buf = malloc(length);
-  else
-    sock->sending_buf = realloc(sock->sending_buf, length + sock->sending_len);
-  memcpy(sock->sending_buf + sock->sending_len, buf, length);
-  sock->sending_len += length;
+  const uint8_t *src = buf;
+  int off = 0;
 
-  pthread_mutex_unlock(&(sock->send_lock));
+  if (length < 0) {
+    perror("ERROR negative length");
+    return EXIT_ERROR;
+  }
+
+  // Queue at most MAX_NETWORK_BUFFER bytes that the backend has not taken
+  // yet. A large write blocks here instead of growing the buffer without bound.
+  while (off < length) {
+    while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
+    }
+    while (sock->sending_len >= MAX_NETWORK_BUFFER) {
+      pthread_cond_wait(&(sock->send_cond), &(sock->send_lock));
+    }
+    int space = MAX_NETWORK_BUFFER - sock->sending_len;
+    int n = length - off;
+    if (n > space) n = space;
+
+    if (sock->sending_buf == NULL)
+      sock->sending_buf = malloc(n);
+    else
+      sock->sending_buf = realloc(sock->sending_buf, sock->sending_len + n);
+    memcpy(sock->sending_buf + sock->sending_len, src + off, n);
+    sock->sending_len += n;
+    off += n;
+    pthread_mutex_unlock(&(sock->send_lock));
+  }
   return EXIT_SUCCESS;
 }

@@ -36,11 +36,21 @@ typedef enum {
   TCP_LISTENER = 1,
 } cmu_socket_type_t;
 
+/**
+ * TCP Reno congestion-control states. See the state diagram in the handout.
+ */
+typedef enum {
+  CC_SLOW_START = 0,
+  CC_AVOIDANCE = 1,
+  CC_FAST_RECOVERY = 2,
+} cc_state_t;
+
 typedef struct {
   // Sender-side
   uint32_t last_ack_received; // window left edge
-  uint32_t next_seq_to_send;  // next byte to transmit
-  uint32_t size;              // window size
+  uint32_t next_seq_to_send;  // next byte to transmit (rewinds after a timeout)
+  uint32_t highwater;         // furthest sequence ever transmitted
+  uint32_t size;              // last effective send window (min of cwnd, adv)
 
   // retransmission timer
   struct timeval timer_start;
@@ -55,7 +65,33 @@ typedef struct {
   uint32_t peer_isn;
   int fin_received;  // peer's FIN has been received in order
 
+  // Congestion control (TCP Reno). All sizes are in bytes.
+  uint32_t cwnd;
+  uint32_t ssthresh;
+  uint32_t ca_carry;  // leftover bytes for the congestion-avoidance increment
+  cc_state_t cc_state;
+  int dup_ack_count;
+  int do_fast_retransmit;  // single_send should resend the oldest unacked seg
+
+  // Flow control. peer_adv_window is the latest window the peer advertised.
+  uint16_t peer_adv_window;
+  // Set when we advertise 0, so a later read can open the window again.
+  int zero_advertised;
+  struct timeval last_wnd_update;
+
 } window_t;
+
+/**
+ * One out-of-order segment held until the gap in front of it is filled.
+ * These bytes count against MAX_NETWORK_BUFFER, same as ordered data.
+ */
+typedef struct recv_seg {
+  uint32_t seq;
+  uint16_t len;
+  uint8_t* data;
+  struct recv_seg* next;
+} recv_seg_t;
+
 typedef struct {
   int socket;
   pthread_t thread_id;
@@ -70,7 +106,16 @@ typedef struct {
   pthread_mutex_t send_lock;
   pthread_mutex_t death_lock;
   pthread_cond_t wait_cond;
-  
+  pthread_cond_t send_cond;
+
+  // Bytes of receive buffer still free, mirrored for the send path.
+  // Updated only while recv_lock is held. The backend thread is the only
+  // thread that shrinks it (by accepting data); the app thread only grows it.
+  uint16_t adv_cache;
+
+  recv_seg_t* ooo_head;
+  uint32_t ooo_bytes;
+
   cmu_socket_type_t type;
   int dying;
 

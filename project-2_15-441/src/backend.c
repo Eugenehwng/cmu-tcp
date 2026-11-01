@@ -22,8 +22,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include "cmu_packet.h"
 #include "cmu_tcp.h"
@@ -61,7 +63,7 @@ static void send_control_packet(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
   uint16_t dst = ntohs(sock->conn.sin_port);
   uint16_t hlen = sizeof(cmu_tcp_header_t);
   uint16_t plen = hlen;
-  uint16_t adv_window = 1;
+  uint16_t adv_window = sock->adv_cache;
 
   uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, plen, flags,
                                adv_window, 0, NULL, NULL, 0);
@@ -85,7 +87,7 @@ static void send_data_segment(cmu_socket_t *sock, uint8_t *data,
   uint32_t ack = sock->window.next_seq_expected;
   uint16_t hlen = sizeof(cmu_tcp_header_t);
   uint16_t plen = hlen + len;
-  uint16_t adv_window = 1;
+  uint16_t adv_window = sock->adv_cache;
 
   uint8_t *pkt =
       create_packet(src, dst, seq, ack, hlen, plen, ACK_FLAG_MASK, adv_window,
@@ -188,6 +190,360 @@ static int timer_expired(cmu_socket_t *sock) {
   return sock->window.timer_running && timer_remaining_ms(sock) == 0;
 }
 
+/* ─────────────────────── congestion control (Reno) ─────────────────────── */
+
+static const char *cc_name(cc_state_t state) {
+  switch (state) {
+    case CC_SLOW_START:
+      return "slow_start";
+    case CC_AVOIDANCE:
+      return "congestion_avoidance";
+    case CC_FAST_RECOVERY:
+      return "fast_recovery";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * Append one row whenever cwnd, ssthresh, or the congestion-control stage
+ * changes. Used to plot the sawtooth for the checkpoint report.
+ */
+static void log_cc(cmu_socket_t *sock, const char *event) {
+  static FILE *fp = NULL;
+  static int tried = 0;
+  if (!tried) {
+    tried = 1;
+    fp = fopen("cwnd_log.csv", "a");
+    if (fp != NULL) {
+      int fd = fileno(fp);
+      flock(fd, LOCK_EX);
+      fseek(fp, 0, SEEK_END);
+      if (ftell(fp) == 0) {
+        fprintf(fp, "time,pid,port,cwnd,ssthresh,peer_adv,state,event\n");
+        fflush(fp);
+      }
+      flock(fd, LOCK_UN);
+    }
+  }
+  if (fp == NULL) return;
+
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  double t = (double)now.tv_sec + (double)now.tv_usec / 1000000.0;
+  fprintf(fp, "%.6f,%d,%u,%u,%u,%u,%s,%s\n", t, (int)getpid(),
+          (unsigned)sock->my_port, sock->window.cwnd, sock->window.ssthresh,
+          (unsigned)sock->window.peer_adv_window, cc_name(sock->window.cc_state),
+          event);
+  fflush(fp);
+}
+
+static void note_peer_window(cmu_socket_t *sock, uint16_t adv) {
+  if (adv == sock->window.peer_adv_window) return;
+  sock->window.peer_adv_window = adv;
+  log_cc(sock, "peer_window");
+}
+
+/** Bytes the sender may have in flight: min(cwnd, peer advertised window). */
+static uint32_t send_window(cmu_socket_t *sock) {
+  uint32_t adv = sock->window.peer_adv_window;
+  uint32_t cwnd = sock->window.cwnd;
+  return adv < cwnd ? adv : cwnd;
+}
+
+/**
+ * Multiplicative decrease. RFC 5681 keeps ssthresh at least two segments so
+ * slow start still has room to run after a loss.
+ */
+static uint32_t half_window(uint32_t cwnd) {
+  uint32_t half = cwnd / 2;
+  uint32_t floor = 2 * (uint32_t)MSS;
+  return half < floor ? floor : half;
+}
+
+static void on_timeout(cmu_socket_t *sock) {
+  sock->window.ssthresh = half_window(sock->window.cwnd);
+  // The published Reno diagram restarts slow start at one segment. The
+  // connection's initial window (WINDOW_INITIAL_WINDOW_SIZE) is separate.
+  sock->window.cwnd = MSS;
+  sock->window.dup_ack_count = 0;
+  sock->window.ca_carry = 0;
+  sock->window.cc_state = CC_SLOW_START;
+  sock->window.do_fast_retransmit = 0;
+  log_cc(sock, "timeout");
+}
+
+/** A cumulative ACK that moved the left edge of the window. */
+static void on_new_ack(cmu_socket_t *sock) {
+  sock->window.dup_ack_count = 0;
+  sock->window.do_fast_retransmit = 0;
+
+  if (sock->window.cc_state == CC_FAST_RECOVERY) {
+    // Reno leaves fast recovery on the first ACK of new data and deflates.
+    sock->window.cwnd = sock->window.ssthresh;
+    sock->window.ca_carry = 0;
+    sock->window.cc_state = CC_AVOIDANCE;
+    log_cc(sock, "fast_recovery_exit");
+    return;
+  }
+
+  if (sock->window.cwnd < sock->window.ssthresh) {
+    sock->window.cwnd += MSS;
+    sock->window.cc_state = (sock->window.cwnd < sock->window.ssthresh)
+                                ? CC_SLOW_START
+                                : CC_AVOIDANCE;
+    log_cc(sock, "slow_start_ack");
+    return;
+  }
+
+  // Congestion avoidance: about one MSS per RTT. The carry keeps the
+  // truncated remainder so the average slope is MSS*(MSS/cwnd).
+  sock->window.cc_state = CC_AVOIDANCE;
+  uint64_t sum = (uint64_t)MSS * (uint64_t)MSS + sock->window.ca_carry;
+  uint32_t inc = (uint32_t)(sum / sock->window.cwnd);
+  sock->window.ca_carry = (uint32_t)(sum % sock->window.cwnd);
+  sock->window.cwnd += inc;
+  if (inc > 0) log_cc(sock, "congestion_avoidance_ack");
+}
+
+/**
+ * Duplicate ACK: same cumulative number, and we still have data outstanding.
+ * The third one (fourth ACK of that number) is fast retransmit.
+ */
+static void on_dup_ack(cmu_socket_t *sock) {
+  if (sock->window.cc_state == CC_FAST_RECOVERY) {
+    sock->window.cwnd += MSS;
+    log_cc(sock, "fast_recovery_dup");
+    return;
+  }
+
+  sock->window.dup_ack_count += 1;
+  if (sock->window.dup_ack_count < 3) return;
+
+  sock->window.ssthresh = half_window(sock->window.cwnd);
+  sock->window.cwnd = sock->window.ssthresh + 3 * (uint32_t)MSS;
+  sock->window.ca_carry = 0;
+  sock->window.cc_state = CC_FAST_RECOVERY;
+  sock->window.do_fast_retransmit = 1;
+  log_cc(sock, "triple_dup_ack");
+}
+
+/* ─────────────────────────── receive buffer ─────────────────────────── */
+
+void refresh_adv_cache(cmu_socket_t *sock) {
+  uint32_t used = (uint32_t)sock->received_len + sock->ooo_bytes;
+  if (used >= MAX_NETWORK_BUFFER) {
+    sock->adv_cache = 0;
+    sock->window.zero_advertised = 1;
+    return;
+  }
+  uint32_t free_bytes = MAX_NETWORK_BUFFER - used;
+  if (free_bytes > 65535) free_bytes = 65535;
+  sock->adv_cache = (uint16_t)free_bytes;
+}
+
+void send_window_update(cmu_socket_t *sock) {
+  if (sock->window.state < ESTABLISHED) return;
+  send_control_packet(sock, sock->window.next_seq_to_send,
+                      sock->window.next_seq_expected, ACK_FLAG_MASK);
+  gettimeofday(&(sock->window.last_wnd_update), NULL);
+}
+
+/**
+ * If the application opened a window we had advertised as zero, repeat the
+ * update until the peer sends data. One lost update would stall the sender.
+ */
+static void maybe_retransmit_window_update(cmu_socket_t *sock) {
+  if (!sock->window.zero_advertised) return;
+  if (sock->window.state < ESTABLISHED) return;
+  if (sock->adv_cache == 0) return;
+
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  long elapsed_ms = (now.tv_sec - sock->window.last_wnd_update.tv_sec) * 1000 +
+                    (now.tv_usec - sock->window.last_wnd_update.tv_usec) / 1000;
+  if (sock->window.last_wnd_update.tv_sec != 0 && elapsed_ms < DEFAULT_TIMEOUT) {
+    return;
+  }
+  send_window_update(sock);
+}
+
+static uint32_t buffer_free(cmu_socket_t *sock) {
+  uint32_t used = (uint32_t)sock->received_len + sock->ooo_bytes;
+  if (used >= MAX_NETWORK_BUFFER) return 0;
+  return MAX_NETWORK_BUFFER - used;
+}
+
+/** Bytes of [start, end) that are already stored out of order. */
+static uint32_t ooo_overlap_bytes(cmu_socket_t *sock, uint32_t start,
+                                  uint32_t end) {
+  uint32_t n = 0;
+  for (recv_seg_t *s = sock->ooo_head; s != NULL; s = s->next) {
+    uint32_t s_end = s->seq + s->len;
+    uint32_t lo = before(s->seq, start) ? start : s->seq;
+    uint32_t hi = before(s_end, end) ? s_end : end;
+    if (before(lo, hi)) n += hi - lo;
+  }
+  return n;
+}
+
+/** Drop or trim out-of-order bytes that fall inside [start, end). */
+static void discard_ooo_range(cmu_socket_t *sock, uint32_t start, uint32_t end) {
+  recv_seg_t **pp = &(sock->ooo_head);
+  while (*pp != NULL) {
+    recv_seg_t *s = *pp;
+    uint32_t s_end = s->seq + s->len;
+    if (!before(s->seq, end) || !after(s_end, start)) {
+      pp = &(s->next);
+      continue;
+    }
+    if (!after(s_end, end)) {
+      sock->ooo_bytes -= s->len;
+      *pp = s->next;
+      free(s->data);
+      free(s);
+      continue;
+    }
+    uint32_t skip = end - s->seq;
+    memmove(s->data, s->data + skip, s->len - skip);
+    sock->ooo_bytes -= skip;
+    s->len = (uint16_t)(s->len - skip);
+    s->seq += skip;
+    pp = &(s->next);
+  }
+}
+
+static void append_recv(cmu_socket_t *sock, uint8_t *data, uint16_t len) {
+  sock->received_buf = realloc(sock->received_buf, sock->received_len + len);
+  memcpy(sock->received_buf + sock->received_len, data, len);
+  sock->received_len += len;
+  sock->window.next_seq_expected += len;
+}
+
+/** Move contiguous out-of-order bytes into the application buffer. */
+static void drain_ooo(cmu_socket_t *sock) {
+  int progressed = 1;
+  while (progressed) {
+    progressed = 0;
+    while (sock->ooo_head != NULL &&
+           !after(sock->ooo_head->seq + sock->ooo_head->len,
+                  sock->window.next_seq_expected)) {
+      recv_seg_t *s = sock->ooo_head;
+      sock->ooo_head = s->next;
+      sock->ooo_bytes -= s->len;
+      free(s->data);
+      free(s);
+      progressed = 1;
+    }
+    if (sock->ooo_head != NULL &&
+        before(sock->ooo_head->seq, sock->window.next_seq_expected) &&
+        after(sock->ooo_head->seq + sock->ooo_head->len,
+              sock->window.next_seq_expected)) {
+      recv_seg_t *s = sock->ooo_head;
+      uint32_t skip = sock->window.next_seq_expected - s->seq;
+      memmove(s->data, s->data + skip, s->len - skip);
+      sock->ooo_bytes -= skip;
+      s->len = (uint16_t)(s->len - skip);
+      s->seq += skip;
+      progressed = 1;
+    }
+    if (sock->ooo_head != NULL &&
+        sock->ooo_head->seq == sock->window.next_seq_expected) {
+      recv_seg_t *s = sock->ooo_head;
+      sock->ooo_head = s->next;
+      sock->ooo_bytes -= s->len;
+      append_recv(sock, s->data, s->len);
+      free(s->data);
+      free(s);
+      progressed = 1;
+    }
+  }
+}
+
+/**
+ * Copy the new bytes of an in-order (or left-overlapping) segment into the
+ * application buffer. Returns 1 if any new byte was delivered.
+ */
+static int take_in_order(cmu_socket_t *sock, uint8_t *payload, uint32_t seq,
+                         uint16_t payload_len) {
+  uint32_t expect = sock->window.next_seq_expected;
+  uint32_t skip = expect - seq;
+  if (skip >= payload_len) return 0;
+  uint16_t new_len = (uint16_t)(payload_len - skip);
+  uint32_t end = expect + new_len;
+  uint32_t freed = ooo_overlap_bytes(sock, expect, end);
+  uint32_t used = (uint32_t)sock->received_len + sock->ooo_bytes;
+  if (freed > used || used - freed + new_len > MAX_NETWORK_BUFFER) return 0;
+
+  discard_ooo_range(sock, expect, end);
+  append_recv(sock, payload + skip, new_len);
+  drain_ooo(sock);
+  return 1;
+}
+
+static void insert_ooo_chunk(cmu_socket_t *sock, uint32_t seq, uint8_t *data,
+                             uint16_t len) {
+  recv_seg_t *node = malloc(sizeof(*node));
+  if (node == NULL) return;
+  node->data = malloc(len);
+  if (node->data == NULL) {
+    free(node);
+    return;
+  }
+  memcpy(node->data, data, len);
+  node->seq = seq;
+  node->len = len;
+  node->next = NULL;
+
+  recv_seg_t **pp = &(sock->ooo_head);
+  while (*pp != NULL && !after((*pp)->seq, seq)) {
+    pp = &((*pp)->next);
+  }
+  node->next = *pp;
+  *pp = node;
+  sock->ooo_bytes += len;
+}
+
+/** Remember the parts of an out-of-order segment we do not already hold. */
+static int insert_ooo(cmu_socket_t *sock, uint32_t seq, uint8_t *data,
+                      uint16_t len) {
+  uint32_t limit = sock->window.next_seq_expected + MAX_NETWORK_BUFFER;
+  if (!before(seq, limit)) return 0;
+
+  int stored = 0;
+  uint32_t pos = seq;
+  uint32_t end = seq + len;
+  while (before(pos, end)) {
+    int inside = 0;
+    recv_seg_t *next_seg = NULL;
+    for (recv_seg_t *s = sock->ooo_head; s != NULL; s = s->next) {
+      uint32_t s_end = s->seq + s->len;
+      if (!after(s->seq, pos) && before(pos, s_end)) {
+        pos = s_end;
+        inside = 1;
+        break;
+      }
+      if (after(s->seq, pos)) {
+        next_seg = s;
+        break;
+      }
+    }
+    if (inside) continue;
+    if (!before(pos, end)) break;
+
+    uint32_t chunk_end = end;
+    if (next_seg != NULL && before(next_seg->seq, chunk_end)) {
+      chunk_end = next_seg->seq;
+    }
+    uint32_t chunk_len = chunk_end - pos;
+    if (chunk_len == 0 || chunk_len > buffer_free(sock)) break;
+    insert_ooo_chunk(sock, pos, data + (pos - seq), (uint16_t)chunk_len);
+    stored = 1;
+    pos = chunk_end;
+  }
+  return stored;
+}
+
 /* ─────────────────────────── receive processing ─────────────────────────── */
 
 /**
@@ -207,6 +563,10 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   int is_fin = flags & FIN_FLAG_MASK;
   uint16_t payload_len = get_payload_len(pkt);
   int need_ack = 0;
+  int delivered = 0;
+
+  // Every packet carries the peer's current receive window.
+  note_peer_window(sock, get_advertised_window(hdr));
 
   if (is_syn) {
     // A retransmitted SYN-ACK after we are ESTABLISHED means our final
@@ -222,25 +582,34 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   if (is_ack) {
     uint32_t ack = get_ack(hdr);
     if (after(ack, sock->window.last_ack_received) &&
-        !after(ack, sock->window.next_seq_to_send)) {
+        !after(ack, sock->window.highwater)) {
       sock->window.last_ack_received = ack;
-      if (sock->window.last_ack_received == sock->window.next_seq_to_send) {
+      // A timeout rewinds next_seq. An ACK can then cover bytes the peer
+      // already buffered, past the rewound cursor. Catch the cursor up.
+      if (before(sock->window.next_seq_to_send, ack)) {
+        sock->window.next_seq_to_send = ack;
+      }
+      on_new_ack(sock);
+      if (sock->window.last_ack_received == sock->window.highwater) {
         stop_timer(sock);
       } else {
         start_timer(sock);
       }
+    } else if (ack == sock->window.last_ack_received &&
+               after(sock->window.highwater, sock->window.last_ack_received)) {
+      // Four ACKs of the same number: the original plus three duplicates.
+      on_dup_ack(sock);
     }
   }
 
   if (payload_len > 0) {
-    if (get_seq(hdr) == sock->window.next_seq_expected) {
-      uint8_t *payload = get_payload(pkt);
-      sock->received_buf =
-          realloc(sock->received_buf, sock->received_len + payload_len);
-      memcpy(sock->received_buf + sock->received_len, payload, payload_len);
-      sock->received_len += payload_len;
-      sock->window.next_seq_expected += payload_len;
-      pthread_cond_signal(&(sock->wait_cond));
+    uint32_t seq = get_seq(hdr);
+    uint32_t expect = sock->window.next_seq_expected;
+    uint8_t *payload = get_payload(pkt);
+    if (!after(seq, expect) && after(seq + payload_len, expect)) {
+      delivered = take_in_order(sock, payload, seq, payload_len);
+    } else if (after(seq, expect)) {
+      insert_ooo(sock, seq, payload, payload_len);
     }
     // Cumulative ACK, also sent for out-of-order or duplicate data so the
     // sender learns what we are still missing.
@@ -256,6 +625,14 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     // ACK retransmitted FINs too: our previous ACK may have been lost.
     need_ack = 1;
   }
+
+  refresh_adv_cache(sock);
+  // The peer is moving again, so a zero-window update is no longer owed
+  // unless accepting this segment just filled the buffer.
+  if (delivered && sock->adv_cache > 0) {
+    sock->window.zero_advertised = 0;
+  }
+  if (delivered) pthread_cond_signal(&(sock->wait_cond));
 
   if (need_ack) {
     send_control_packet(sock, sock->window.next_seq_to_send,
@@ -311,8 +688,30 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags) {
 /* ─────────────────────────── Part 3: sending ─────────────────────────── */
 
 /**
- * Sends `data` using a fixed-size sliding window with Go-Back-N
- * retransmission. Returns once every byte has been acknowledged.
+ * Resend the oldest unacknowledged segment. Fast retransmit does this once;
+ * it does not rewind the send pointer, so later segments stay outstanding.
+ */
+static void retransmit_oldest(cmu_socket_t *sock, uint8_t *data,
+                              uint32_t seq_base) {
+  uint32_t seq = sock->window.last_ack_received;
+  // Prefer the high-water mark: next_seq may have been rewound by a timeout.
+  uint32_t sent_end = sock->window.highwater;
+  if (before(sent_end, sock->window.next_seq_to_send)) {
+    sent_end = sock->window.next_seq_to_send;
+  }
+  if (!before(seq, sent_end)) return;
+  uint32_t have = sent_end - seq;
+  uint16_t len = (uint16_t)MIN((uint32_t)MSS, have);
+  send_data_segment(sock, data, seq_base, seq, len);
+  // The retransmitted segment is now the oldest outstanding byte. Give it a
+  // full RTO instead of inheriting a timer that is about to fire.
+  start_timer(sock);
+}
+
+/**
+ * Send `data` under TCP Reno. The usable window is min(cwnd, advertised
+ * window). A timeout rewinds to the left edge and re-enters slow start. Three
+ * duplicate ACKs retransmit only the missing segment and enter fast recovery.
  *
  * @param sock The socket to use for sending data.
  * @param data The data to be sent.
@@ -324,40 +723,65 @@ void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
   uint32_t seq_base = sock->window.next_seq_to_send;
   uint32_t seq_end = seq_base + (uint32_t)buf_len;
 
-  while (sock->window.last_ack_received != seq_end) {
-    /* A. Fill the window. */
+  while (before(sock->window.last_ack_received, seq_end)) {
+    // ACKs already queued must be applied before a timeout, or a packet that
+    // arrived on time gets treated as loss.
+    while (receive_and_handle(sock, 0)) {
+    }
+    if (!before(sock->window.last_ack_received, seq_end)) break;
+
+    int timed_out = 0;
+    if (timer_expired(sock) &&
+        after(sock->window.highwater, sock->window.last_ack_received)) {
+      on_timeout(sock);
+      // Rewind the send cursor and arm a fresh RTO. Leaving the old timer
+      // running would make every following iteration look like another timeout.
+      sock->window.next_seq_to_send = sock->window.last_ack_received;
+      start_timer(sock);
+      timed_out = 1;
+    } else if (sock->window.do_fast_retransmit) {
+      retransmit_oldest(sock, data, seq_base);
+      sock->window.do_fast_retransmit = 0;
+    }
+
+    int force_one = timed_out;
     while (before(sock->window.next_seq_to_send, seq_end)) {
-      uint32_t in_flight =
+      uint32_t flight =
           sock->window.next_seq_to_send - sock->window.last_ack_received;
-      if (in_flight >= sock->window.size) break;
-      uint32_t room = sock->window.size - in_flight;
+      uint32_t win = send_window(sock);
+      sock->window.size = win;
+      if (flight >= win) {
+        // A shut window still needs one retransmission after a timeout, or
+        // the peer never regenerates the ACK that opens it.
+        if (force_one && flight == 0) {
+          // Zero-window probe: one byte, so a lost ACK can be regenerated
+          // without ignoring the peer's advertised window.
+          win = 1;
+        } else {
+          break;
+        }
+      }
+      force_one = 0;
+      uint32_t room = win - flight;
       uint32_t remaining = seq_end - sock->window.next_seq_to_send;
       uint16_t payload_len =
           (uint16_t)MIN((uint32_t)MSS, MIN(remaining, room));
+      if (payload_len == 0) break;
 
       send_data_segment(sock, data, seq_base, sock->window.next_seq_to_send,
                         payload_len);
       if (!sock->window.timer_running) start_timer(sock);
       sock->window.next_seq_to_send += payload_len;
+      if (!before(sock->window.next_seq_to_send, sock->window.highwater)) {
+        sock->window.highwater = sock->window.next_seq_to_send;
+      }
     }
+    if (timed_out && !sock->window.timer_running) start_timer(sock);
 
-    /* B. Wait for an ACK, but no longer than the retransmission timer allows,
-     * then drain anything else already queued. */
+    maybe_retransmit_window_update(sock);
     if (receive_and_handle(sock, timer_remaining_ms(sock))) {
       while (receive_and_handle(sock, 0)) {
       }
-    }
-
-    /* C. Go-Back-N: resend everything in [last_ack_received, next_seq). */
-    if (timer_expired(sock)) {
-      uint32_t s = sock->window.last_ack_received;
-      while (before(s, sock->window.next_seq_to_send)) {
-        uint16_t len = (uint16_t)MIN((uint32_t)MSS,
-                                     sock->window.next_seq_to_send - s);
-        send_data_segment(sock, data, seq_base, s, len);
-        s += len;
-      }
-      start_timer(sock);
     }
   }
 }
@@ -390,6 +814,7 @@ static void initiator_handshake(cmu_socket_t *sock) {
 
       sock->conn = from;
       sock->window.peer_isn = get_seq(hdr);
+      note_peer_window(sock, get_advertised_window(hdr));
       sock->window.next_seq_expected = sock->window.peer_isn + 1;
 
       send_control_packet(sock, my_isn + 1, sock->window.next_seq_expected,
@@ -397,6 +822,7 @@ static void initiator_handshake(cmu_socket_t *sock) {
 
       sock->window.last_ack_received = my_isn + 1;
       sock->window.next_seq_to_send = my_isn + 1;
+      sock->window.highwater = my_isn + 1;
       sock->window.state = ESTABLISHED;
       stop_timer(sock);
       free(pkt);
@@ -426,6 +852,7 @@ static void listener_handshake(cmu_socket_t *sock) {
     sock->conn = from;
     peer_isn = get_seq(hdr);
     sock->window.peer_isn = peer_isn;
+    note_peer_window(sock, get_advertised_window(hdr));
     sock->window.next_seq_expected = peer_isn + 1;
     free(pkt);
     break;
@@ -434,6 +861,7 @@ static void listener_handshake(cmu_socket_t *sock) {
   sock->window.state = SYN_RCVD;
   sock->window.last_ack_received = my_isn + 1;
   sock->window.next_seq_to_send = my_isn + 1;
+  sock->window.highwater = my_isn + 1;
 
   /* Phase B: send SYN-ACK, wait for the final ACK (or in-order data). */
   while (1) {
@@ -474,6 +902,7 @@ static void listener_handshake(cmu_socket_t *sock) {
 
       if (good_ack || in_order_data) {
         sock->conn = from;
+        note_peer_window(sock, get_advertised_window(hdr));
         sock->window.state = ESTABLISHED;
         stop_timer(sock);
         if (has_payload) {
@@ -507,6 +936,7 @@ static void teardown(cmu_socket_t *sock) {
 
   // The FIN consumes one sequence number; it is ACKed with fin_seq + 1.
   sock->window.next_seq_to_send = fin_seq + 1;
+  sock->window.highwater = fin_seq + 1;
   sock->window.state = active_close ? FIN_WAIT_1 : LAST_ACK;
 
   for (int tries = 0; tries < MAX_FIN_TRANSMISSIONS &&
@@ -556,6 +986,7 @@ void *begin_backend(void *in) {
   sock->window.timer_running = 0;
   sock->window.peer_isn = 0;
   sock->window.fin_received = 0;
+  log_cc(sock, "init");
 
   if (sock->type == TCP_INITIATOR) {
     initiator_handshake(sock);
@@ -584,6 +1015,7 @@ void *begin_backend(void *in) {
       sock->sending_len = 0;
       free(sock->sending_buf);
       sock->sending_buf = NULL;
+      pthread_cond_signal(&(sock->send_cond));
       pthread_mutex_unlock(&(sock->send_lock));
       single_send(sock, data, buf_len);
       free(data);
@@ -591,6 +1023,7 @@ void *begin_backend(void *in) {
       pthread_mutex_unlock(&(sock->send_lock));
     }
 
+    maybe_retransmit_window_update(sock);
     check_for_data(sock, NO_WAIT);
 
     while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {

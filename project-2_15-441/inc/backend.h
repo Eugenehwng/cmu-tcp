@@ -16,11 +16,25 @@
 #ifndef PROJECT_2_15_441_INC_BACKEND_H_
 #define PROJECT_2_15_441_INC_BACKEND_H_
 
+#include "cmu_tcp.h"
+
 /**
  * Launches the CMU-TCP backend.
  *
  * @param in the socket to be used for backend processing.
  */
 void* begin_backend(void* in);
+
+/**
+ * Recompute the advertised window from the bytes currently buffered
+ * (ordered unread data plus out-of-order data). Caller must hold recv_lock.
+ */
+void refresh_adv_cache(cmu_socket_t* sock);
+
+/**
+ * Tell the peer that our receive window has opened. Caller must hold
+ * recv_lock. Used after the application drains a full buffer.
+ */
+void send_window_update(cmu_socket_t* sock);
 
 #endif  // PROJECT_2_15_441_INC_BACKEND_H_
