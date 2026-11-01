@@ -197,12 +197,12 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
           sock->received_buf = NULL;
           sock->received_len = 0;
         }
-        // A full window stays shut until the application reads. Tell the
-        // peer once, when this read is what opens it. Later reads piggyback
-        // the new window on ordinary ACKs, so we don't emit extra dup ACKs.
-        int was_closed = sock->adv_cache == 0;
+        // Data leaving the buffer opens receive window that the peer cannot
+        // see until we send it. The next data segment may never arrive if the
+        // sender is stuck on the old, smaller window.
+        uint16_t prev_adv = sock->adv_cache;
         refresh_adv_cache(sock);
-        if (was_closed && sock->adv_cache > 0) {
+        if (sock->adv_cache > prev_adv) {
           send_window_update(sock);
         }
       }

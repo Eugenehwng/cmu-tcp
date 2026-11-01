@@ -273,10 +273,18 @@ static void on_timeout(cmu_socket_t *sock) {
   log_cc(sock, "timeout");
 }
 
-/** A cumulative ACK that moved the left edge of the window. */
-static void on_new_ack(cmu_socket_t *sock) {
+/**
+ * Bytes newly acknowledged by one cumulative ACK.
+ *
+ * Slow start adds those bytes, so acknowledging a full flight doubles cwnd
+ * whether the peer ACKs every segment or the whole flight at once.
+ * Congestion avoidance adds about one MSS per cwnd bytes acknowledged, so a
+ * flight ACK grows the window by one segment instead of doubling it.
+ */
+static void on_new_ack(cmu_socket_t *sock, uint32_t acked) {
   sock->window.dup_ack_count = 0;
   sock->window.do_fast_retransmit = 0;
+  if (acked == 0) return;
 
   if (sock->window.cc_state == CC_FAST_RECOVERY) {
     // Reno leaves fast recovery on the first ACK of new data and deflates.
@@ -288,20 +296,29 @@ static void on_new_ack(cmu_socket_t *sock) {
   }
 
   if (sock->window.cwnd < sock->window.ssthresh) {
-    sock->window.cwnd += MSS;
-    sock->window.cc_state = (sock->window.cwnd < sock->window.ssthresh)
-                                ? CC_SLOW_START
-                                : CC_AVOIDANCE;
-    log_cc(sock, "slow_start_ack");
-    return;
+    uint32_t room = sock->window.ssthresh - sock->window.cwnd;
+    uint32_t add = acked < room ? acked : room;
+    sock->window.cwnd += add;
+    acked -= add;
+    if (sock->window.cwnd < sock->window.ssthresh) {
+      sock->window.cc_state = CC_SLOW_START;
+      log_cc(sock, "slow_start_ack");
+      return;
+    }
+    sock->window.cc_state = CC_AVOIDANCE;
+    sock->window.ca_carry = 0;
+    if (acked == 0) {
+      log_cc(sock, "slow_start_ack");
+      return;
+    }
   }
 
-  // Congestion avoidance: about one MSS per RTT. The carry keeps the
-  // truncated remainder so the average slope is MSS*(MSS/cwnd).
   sock->window.cc_state = CC_AVOIDANCE;
-  uint64_t sum = (uint64_t)MSS * (uint64_t)MSS + sock->window.ca_carry;
-  uint32_t inc = (uint32_t)(sum / sock->window.cwnd);
-  sock->window.ca_carry = (uint32_t)(sum % sock->window.cwnd);
+  if (sock->window.cwnd == 0) return;
+  uint64_t credit =
+      (uint64_t)MSS * (uint64_t)acked + sock->window.ca_carry;
+  uint32_t inc = (uint32_t)(credit / sock->window.cwnd);
+  sock->window.ca_carry = (uint32_t)(credit % sock->window.cwnd);
   sock->window.cwnd += inc;
   if (inc > 0) log_cc(sock, "congestion_avoidance_ack");
 }
@@ -565,8 +582,12 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   int need_ack = 0;
   int delivered = 0;
 
-  // Every packet carries the peer's current receive window.
-  note_peer_window(sock, get_advertised_window(hdr));
+  // Every packet carries the peer's current receive window. A pure window
+  // update repeats the ACK number; that is not a signal of loss.
+  uint16_t prev_adv = sock->window.peer_adv_window;
+  uint16_t new_adv = get_advertised_window(hdr);
+  note_peer_window(sock, new_adv);
+  int window_update = new_adv != prev_adv;
 
   if (is_syn) {
     // A retransmitted SYN-ACK after we are ESTABLISHED means our final
@@ -583,19 +604,20 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     uint32_t ack = get_ack(hdr);
     if (after(ack, sock->window.last_ack_received) &&
         !after(ack, sock->window.highwater)) {
+      uint32_t acked = ack - sock->window.last_ack_received;
       sock->window.last_ack_received = ack;
       // A timeout rewinds next_seq. An ACK can then cover bytes the peer
       // already buffered, past the rewound cursor. Catch the cursor up.
       if (before(sock->window.next_seq_to_send, ack)) {
         sock->window.next_seq_to_send = ack;
       }
-      on_new_ack(sock);
+      on_new_ack(sock, acked);
       if (sock->window.last_ack_received == sock->window.highwater) {
         stop_timer(sock);
       } else {
         start_timer(sock);
       }
-    } else if (ack == sock->window.last_ack_received &&
+    } else if (!window_update && ack == sock->window.last_ack_received &&
                after(sock->window.highwater, sock->window.last_ack_received)) {
       // Four ACKs of the same number: the original plus three duplicates.
       on_dup_ack(sock);
